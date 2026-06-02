@@ -287,7 +287,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(2, devicePixelRatio));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.35;
+renderer.toneMappingExposure = 1.08;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 addEventListener("resize", () => {
@@ -296,12 +296,12 @@ addEventListener("resize", () => {
 });
 
 // 조명 (재질이 보일 최소한, 야간 톤)
-scene.add(new THREE.AmbientLight(0x35415e, 0.7));
-const hemi = new THREE.HemisphereLight(0x47557e, 0x2c2014, 0.85); scene.add(hemi);
-const moon = new THREE.DirectionalLight(0xbcc8e4, 0.45); moon.position.set(-3, 12, -6); scene.add(moon);
+scene.add(new THREE.AmbientLight(0x2a3450, 0.3));
+const hemi = new THREE.HemisphereLight(0x3a4566, 0x241a10, 0.4); scene.add(hemi);
+const moon = new THREE.DirectionalLight(0x9fb0d0, 0.28); moon.position.set(-3, 12, -6); scene.add(moon);
 // 가로등용 포인트 라이트 풀
 const lampLights = [];
-for (let k = 0; k < 10; k++) { const L = new THREE.PointLight(0xff9633, 0, 22, 1.5); scene.add(L); lampLights.push(L); }
+for (let k = 0; k < 10; k++) { const L = new THREE.PointLight(0xff9633, 0, 13, 2.0); scene.add(L); lampLights.push(L); }
 
 // 달
 const moonMesh = new THREE.Mesh(new THREE.SphereGeometry(3, 24, 24), new THREE.MeshBasicMaterial({ color: 0xf1ecd6 }));
@@ -360,7 +360,7 @@ function updateLamps() {
   }
   cands.sort((a, b) => a[0] - b[0]);
   for (let k = 0; k < lampLights.length; k++) {
-    if (k < cands.length) { lampLights[k].position.copy(cands[k][1]); lampLights[k].intensity = 17; }
+    if (k < cands.length) { lampLights[k].position.copy(cands[k][1]); lampLights[k].intensity = 16; }
     else lampLights[k].intensity = 0;
   }
 }
