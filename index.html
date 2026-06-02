@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>골목 산책 · Alley Walk</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+  #game { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  #hud {
+    position: fixed; left: 14px; top: 12px; color: #d9c9a8;
+    font: 13px/1.5 ui-monospace, "Cascadia Mono", monospace;
+    text-shadow: 0 1px 3px #000; pointer-events: none; opacity: .85;
+  }
+  #hud b { color: #ffba66; }
+  #title {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    color: #f0e2c4; background: radial-gradient(circle at 50% 60%, rgba(20,12,4,.2), rgba(0,0,0,.85));
+    font-family: ui-serif, Georgia, serif; transition: opacity 1s ease; z-index: 10;
+  }
+  #title h1 { font-size: clamp(28px, 6vw, 56px); letter-spacing: .15em; margin: 0 0 .1em;
+    color: #ffcf8a; text-shadow: 0 0 24px rgba(255,150,60,.5); font-weight: 500; }
+  #title .dedication { font-size: 16px; letter-spacing: .25em; color: #e7b277;
+    opacity: .85; margin: 0 0 1em; font-style: italic; }
+  #title p { margin: .2em; opacity: .8; font-size: 15px; letter-spacing: .04em; }
+  #title .keys { margin-top: 1.4em; font: 13px ui-monospace, monospace; opacity: .7; }
+  #title.hidden { opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="title">
+  <h1>골목 산책</h1>
+  <div class="dedication">for 하늘</div>
+  <p>밤의 골목을 따라 천천히 걸어보세요</p>
+  <div class="keys">W / ↑ 앞으로 &nbsp;·&nbsp; S / ↓ 뒤로 &nbsp;·&nbsp; A · D 좌우 &nbsp;·&nbsp; 화면 클릭 / 탭으로 전진<br>R 비 켜기/끄기 &nbsp;·&nbsp; M 소리 켜기/끄기</div>
+</div>
+
+<script>
+"use strict";
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const title = document.getElementById("title");
+
+let W = 0, H = 0, focal = 0, horizon = 0;
+function resize() {
+  W = canvas.width = Math.floor(window.innerWidth * (window.devicePixelRatio > 1 ? 1 : 1));
+  H = canvas.height = Math.floor(window.innerHeight);
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  W = canvas.width; H = canvas.height;
+  focal = W * 0.62;
+  horizon = H * 0.52;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---- World constants ----
+const ROAD_HALF = 2.7;     // alley half-width (units) — 좁은 주택가 골목
+const SEG = 5;             // building segment length along z — 집 한 채 폭
+const EYE = 1.55;          // camera eye height
+const NEAR = 0.6;          // near clip
+const FAR = 210;           // render distance
+
+// ---- Camera / player ----
+const cam = { x: 0, z: -4, vx: 0, vz: 0, bob: 0 };
+
+// ---- Deterministic per-segment building data ----
+const segCache = new Map();
+function hash(n) { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+
+function building(i, side) {
+  const key = i * 4 + (side > 0 ? 1 : 0);
+  let b = segCache.get(key);
+  if (b) return b;
+  const r = (s) => hash(key * 17.3 + s * 2.13);
+  const floorH = 3;
+  const h = 4.5 + r(1) * 7;                       // 높이 편차 크게 (1.5~3.5층)
+  const floors = Math.max(1, Math.floor(h / floorH));
+
+  // 외장재: 대부분 빨간벽돌, 일부는 페인트/스투코 이웃집
+  const isBrick = r(20) < 0.72;
+  const hue = 7 + r(2) * 10;                      // 빨강~주황벽돌
+  const sat = 44 + r(3) * 18;
+  const lig = 18 + r(4) * 9;
+  const paintHues = [38, 26, 350, 8, 205, 40];    // 베이지/핑크/회청 이웃집
+  const ph = paintHues[Math.floor(r(21) * paintHues.length) % paintHues.length];
+  const pl = 24 + r(22) * 12;
+
+  // 집 유형 다각화
+  const roof = r(23) < 0.55 ? "tile" : "flat";    // 기와 / 평지붕
+  const greenTile = r(24) < 0.25;                 // 청기와
+  const basement = r(25) < 0.55;                  // 반지하(회색 베이스)
+  const stair = r(26) < 0.45;                     // 외부 계단
+  const bay = r(27) < 0.24;                       // 출창(돌출창)
+
+  const hasLamp = ((i + (side > 0 ? 2 : 0)) % 3 === 0) && r(5) > 0.3;
+  const pole = ((i + (side > 0 ? 1 : 0)) % 4 === 0) && r(28) > 0.4; // 전봇대
+  const cable = r(10) > 0.32;
+  const ac = r(11) > 0.5;
+  const hasPlants = r(6) > 0.5;
+  const weeds = r(29) > 0.45;                      // 화단 잡초
+  const prop = r(7) > 0.8 ? 1 : (r(8) > 0.62 ? 2 : 0); // 1=스쿠터,2=수거통
+  const cols = 1 + (r(31) > 0.4 ? 1 : 0);          // 층당 창 1~2
+  const doorCols = ["#2f5630", "#39291d", "#605a4e", "#4a3724", "#2a4a4e"]; // 초록/갈색/회색
+  const door = doorCols[Math.floor(r(30) * doorCols.length) % doorCols.length];
+
+  // 입체: 후퇴(setback) / 깊이 / 담장 / 계단 돌출
+  const setback = r(34) < 0.4 ? 0.05 : 0.35 + r(35) * 1.05;
+  const depth = 2.0 + r(36) * 1.2;
+  const wall = setback > 0.4 && r(37) > 0.32;
+  const stairOut = 0.85 + r(38) * 0.55;
+
+  b = {
+    h, floors, floorH, isBrick, roof, greenTile, basement, stair, bay,
+    hasLamp, pole, cable, ac, hasPlants, weeds, prop, cols, door,
+    setback, depth, wall, stairOut,
+    sideCol: isBrick ? `hsl(${hue},${sat}%,${Math.max(4, lig - 11)}%)`
+                     : `hsl(${ph},13%,${Math.max(6, pl - 11)}%)`,
+    brickBase: `hsl(${hue},${sat}%,${lig - 4}%)`,
+    brickTop:  `hsl(${hue},${sat}%,${lig + 4}%)`,
+    mortar:    `hsl(${hue},12%,${lig + 24}%)`,
+    seam:      `hsl(${hue},${sat}%,${Math.max(6, lig - 9)}%)`,
+    wallBase:  `hsl(${ph},13%,${pl - 5}%)`,        // 비벽돌 외벽
+    wallTop:   `hsl(${ph},13%,${pl + 3}%)`,
+    band:      "#6d675c",                           // 콘크리트 띠 (차분하게)
+    bandTop:   "#767065",
+    baseCol:   "#45423c",                           // 반지하 회색 베이스
+    concrete:  "#6f6a5e",                           // 외부계단/콘크리트
+    roofCol:   greenTile ? "#3a5630" : `hsl(${15 + r(32) * 8},58%,${30 + r(33) * 9}%)`, // 기와
+    roofShad:  greenTile ? "#22341c" : "hsl(14,52%,18%)",
+    r,
+    lampZ: i * SEG + SEG * 0.5,
+  };
+  segCache.set(key, b);
+  return b;
+}
+
+// ---- Projection ----
+function project(x, y, z) {
+  const dz = z - cam.z;
+  if (dz < NEAR) return null;
+  const s = focal / dz;
+  return {
+    x: W * 0.5 + (x - cam.x) * s,
+    y: horizon - (y - (EYE + cam.bob)) * s,
+    s, dz,
+  };
+}
+
+function quad(a, b, c, d, fill) {
+  if (!a || !b || !c || !d) return;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+// additive radial glow
+function glow(px, py, radius, color, alpha) {
+  if (radius < 1) return;
+  ctx.globalCompositeOperation = "lighter";
+  const g = ctx.createRadialGradient(px, py, 0, px, py, radius);
+  g.addColorStop(0, color);
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = g;
+  ctx.fillRect(px - radius, py - radius, radius * 2, radius * 2);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// wet-ground vertical reflection streak (object glints on the film of water)
+function reflect(px, contactY, length, color, alpha) {
+  if (length < 2) return;
+  ctx.globalCompositeOperation = "lighter";
+  const g = ctx.createLinearGradient(px, contactY, px, contactY + length);
+  g.addColorStop(0, color);
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = g;
+  // slight ripple wobble so it reads as water, not a mirror
+  const wob = 1 + Math.sin(now * 0.003 + px) * 0.4;
+  ctx.fillRect(px - 2 * wob, contactY, 4 * wob, length);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+}
+
+let now = 0;
+
+// ---- Sky / moon / stars ----
+const stars = Array.from({ length: 90 }, (_, i) => ({
+  x: hash(i * 3.1), y: hash(i * 7.7) * 0.42, m: hash(i * 1.3),
+}));
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, horizon + 40);
+  g.addColorStop(0, "#070a14");
+  g.addColorStop(0.55, "#0d1018");
+  g.addColorStop(0.85, "#1c1408");
+  g.addColorStop(1, "#2a1c0a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, horizon + 60);
+  // stars (subtle parallax with strafe)
+  for (const s of stars) {
+    const sx = ((s.x - cam.x * 0.004) % 1 + 1) % 1 * W;
+    const sy = s.y * horizon;
+    ctx.globalAlpha = 0.3 + s.m * 0.5;
+    ctx.fillStyle = "#cdd6ef";
+    ctx.fillRect(sx, sy, 1.4, 1.4);
+  }
+  ctx.globalAlpha = 1;
+  // moon
+  const mx = W * 0.52 - cam.x * 1.2, my = horizon * 0.22;
+  glow(mx, my, 90, "rgba(220,225,210,.55)", 0.8);
+  ctx.beginPath(); ctx.arc(mx, my, 13, 0, Math.PI * 2);
+  ctx.fillStyle = "#f1ecd6"; ctx.fill();
+}
+
+// ---- Ground ----
+function drawGround() {
+  const nz = cam.z + NEAR, fz = cam.z + FAR;
+  const a = project(-ROAD_HALF * 4, 0, fz), b = project(ROAD_HALF * 4, 0, fz);
+  const c = project(ROAD_HALF * 4, 0, nz), d = project(-ROAD_HALF * 4, 0, nz);
+  // 시멘트 포장 골목 (야간이라 어둡고 가로등 빛으로 따뜻하게 물듦)
+  const g = ctx.createLinearGradient(0, horizon, 0, H);
+  g.addColorStop(0, "#15130f");
+  g.addColorStop(0.45, "#1d1a15");
+  g.addColorStop(1, "#2a2620");
+  quad(a, b, c, d, g);
+  // 가운데 배수로 라인
+  const c1 = project(0, 0, cam.z + NEAR), c2 = project(0, 0, cam.z + 80);
+  if (c1 && c2) {
+    ctx.strokeStyle = "rgba(0,0,0,0.4)"; ctx.lineWidth = Math.max(1, c1.s * 0.02);
+    ctx.beginPath(); ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y); ctx.stroke();
+  }
+  // 포장 이음새(가로줄)
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1;
+  for (let zz = Math.ceil(cam.z / 4) * 4; zz < cam.z + 70; zz += 4) {
+    const e1 = project(-ROAD_HALF, 0, zz), e2 = project(ROAD_HALF, 0, zz);
+    if (!e1 || !e2) continue;
+    ctx.globalAlpha = Math.min(0.3, e1.s * 0.03);
+    ctx.beginPath(); ctx.moveTo(e1.x, e1.y); ctx.lineTo(e2.x, e2.y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---- Facade + windows for one side of one segment ----
+function drawFacade(i, side) {
+  const b = building(i, side);
+  const z0 = i * SEG, z1 = z0 + SEG;
+  if (z1 < cam.z + NEAR) return;
+  const x = side * (ROAD_HALF + b.setback);              // 전면 (후퇴 반영)
+  const xb = side * (ROAD_HALF + b.setback + b.depth);   // 깊이 안쪽
+  const cz0 = Math.max(z0, cam.z + NEAR);
+  const floorH = b.floorH, floors = b.floors, near = z0 < cam.z + 42;
+
+  const bl = project(x, 0, cz0), br = project(x, 0, z1);
+  const tr = project(x, b.h, z1), tl = project(x, b.h, cz0);
+  if (!bl || !br || !tr || !tl) return;
+
+  // ---- 측면(깊이) 벽 : 입체감의 핵심 ----
+  if (z0 > cam.z + NEAR) {
+    quad(project(x, 0, z0), project(xb, 0, z0),
+         project(xb, b.h, z0), project(x, b.h, z0), b.sideCol);
+  }
+
+  // ---- 전면 외벽 ----
+  const fg = ctx.createLinearGradient(0, Math.max(bl.y, br.y), 0, Math.min(tl.y, tr.y));
+  fg.addColorStop(0, b.isBrick ? b.brickBase : b.wallBase);
+  fg.addColorStop(1, b.isBrick ? b.brickTop : b.wallTop);
+  quad(bl, br, tr, tl, fg);
+
+  // 가로 띠 헬퍼
+  const band = (yy, th, col) => quad(project(x, yy, cz0), project(x, yy, z1),
+        project(x, yy + th, z1), project(x, yy + th, cz0), col);
+  // 콘크리트 틀 + 블라인드 창 헬퍼
+  const win = (wy, wz, ww, wh, seed) => {
+    const g1 = project(x, wy, wz), g2 = project(x, wy, wz + ww),
+          g3 = project(x, wy + wh, wz + ww), g4 = project(x, wy + wh, wz);
+    if (!g1 || !g2 || !g3 || !g4) return;
+    // 콘크리트 틀 — 벽 톤과 가깝게(떠 보이지 않도록)
+    quad(project(x, wy - 0.1, wz - 0.1), project(x, wy - 0.1, wz + ww + 0.1),
+         project(x, wy + wh + 0.1, wz + ww + 0.1), project(x, wy + wh + 0.1, wz - 0.1), "#48443d");
+    if (b.r(seed) > 0.66) {
+      quad(g1, g2, g3, g4, b.r(seed + 1) > 0.5 ? "#ffc878" : "#ffd9a0");
+      ctx.strokeStyle = "rgba(120,70,20,0.35)"; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+      for (let yy = wy + 0.18; yy < wy + wh; yy += 0.22) {
+        const a1 = project(x, yy, wz), a2 = project(x, yy, wz + ww);
+        if (a1 && a2) { ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(a2.x, a2.y); ctx.stroke(); }
+      }
+      ctx.globalAlpha = 1;
+      glow((g1.x + g3.x) / 2, (g1.y + g3.y) / 2, g1.s * 0.45, "rgba(255,170,80,.4)", 0.28);
+    } else {
+      // 어두운 유리 — 위는 하늘빛 반사, 아래는 어둡게 (구멍처럼 비치지 않게)
+      const gg = ctx.createLinearGradient(0, Math.min(g3.y, g4.y), 0, Math.max(g1.y, g2.y));
+      gg.addColorStop(0, "#28313f"); gg.addColorStop(1, "#161c26");
+      quad(g1, g2, g3, g4, gg);
+    }
+  };
+
+  // 벽돌 줄눈
+  if (b.isBrick && near) {
+    ctx.strokeStyle = b.mortar; ctx.lineWidth = 1; ctx.globalAlpha = 0.14;
+    for (let yy = 0.34; yy < b.h - 0.2; yy += 0.34) {
+      const e1 = project(x, yy, cz0), e2 = project(x, yy, z1);
+      if (e1 && e2) { ctx.beginPath(); ctx.moveTo(e1.x, e1.y); ctx.lineTo(e2.x, e2.y); ctx.stroke(); }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 모서리 음영
+  ctx.strokeStyle = b.seam; ctx.lineWidth = Math.max(0.6, bl.s * 0.03); ctx.globalAlpha = 0.5;
+  ctx.beginPath(); ctx.moveTo(bl.x, bl.y); ctx.lineTo(tl.x, tl.y); ctx.stroke(); ctx.globalAlpha = 1;
+
+  // 반지하 회색 베이스 + 반지하 창
+  const baseH = b.basement ? 1.5 : 0;
+  if (b.basement) {
+    band(0, baseH, b.baseCol);
+    if (near) for (let c = 0; c < 2; c++) win(0.55, z0 + (c + 0.5) * (SEG / 2) - 0.55, 1.1, 0.6, c * 5 + 90);
+  }
+
+  // 층 콘크리트 띠
+  for (let f = 1; f < floors; f++) band(f * floorH - 0.12, 0.2, b.band);
+
+  // ---- 3D 외부 계단 (골목쪽으로 돌출) ----
+  if (b.stair && z0 < cam.z + 55) {
+    const xo = x - side * b.stairOut;             // 바깥(골목) 모서리
+    const zStart = z0 + 0.5, zs1 = zStart + 2.8, topY = 3.2;
+    const cz = Math.max(zStart, cam.z + NEAR);
+    // 바깥 측면 삼각형 (어두운 콘크리트)
+    const o0 = project(xo, 0, cz), o1 = project(xo, 0, zs1), o2 = project(xo, topY, zs1);
+    if (o0 && o1 && o2) {
+      ctx.fillStyle = "#494640"; // 바깥 측면(그림자) — 어둡게
+      ctx.beginPath(); ctx.moveTo(o0.x, o0.y); ctx.lineTo(o1.x, o1.y); ctx.lineTo(o2.x, o2.y); ctx.closePath(); ctx.fill();
+    }
+    // 윗면 경사 디딤판 (콘크리트, 너무 희지 않게)
+    quad(project(x, 0, cz), project(xo, 0, cz),
+         project(xo, topY, zs1), project(x, topY, zs1), "#6b665b");
+    ctx.strokeStyle = "rgba(0,0,0,0.32)"; ctx.lineWidth = 1;
+    for (let t = 0.04; t < 1; t += 0.1) {
+      const zz = zStart + (zs1 - zStart) * t, yy = topY * t;
+      const s1 = project(x, yy, zz), s2 = project(xo, yy, zz);
+      if (s1 && s2) { ctx.beginPath(); ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y); ctx.stroke(); }
+    }
+    // 난간
+    const h1 = project(xo, 1.0, zStart), h2 = project(xo, topY + 0.95, zs1);
+    if (h1 && h2) { ctx.strokeStyle = "rgba(20,20,22,0.85)"; ctx.lineWidth = Math.max(1, (o0 ? o0.s : 4) * 0.02);
+      ctx.beginPath(); ctx.moveTo(h1.x, h1.y); ctx.lineTo(h2.x, h2.y); ctx.stroke(); }
+    // 2층 현관문 (전면)
+    quad(project(x, topY, zs1 - 0.1), project(x, topY, zs1 + 1.0),
+         project(x, topY + 1.9, zs1 + 1.0), project(x, topY + 1.9, zs1 - 0.1), b.door);
+  }
+
+  // 1층 현관문
+  {
+    const dz0 = z0 + (b.stair ? 3.5 : 1.0), dz1 = dz0 + 1.0, dh = 2.0;
+    if (dz1 > cam.z + NEAR && dz0 > cam.z + NEAR) {
+      quad(project(x, baseH, dz0), project(x, baseH, dz1),
+           project(x, baseH + dh, dz1), project(x, baseH + dh, dz0), b.door);
+      band(baseH + dh, 0.18, b.band);
+      ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1;
+      const m1 = project(x, baseH + 0.2, (dz0 + dz1) / 2), m2 = project(x, baseH + dh - 0.2, (dz0 + dz1) / 2);
+      if (m1 && m2) { ctx.beginPath(); ctx.moveTo(m1.x, m1.y); ctx.lineTo(m2.x, m2.y); ctx.stroke(); }
+    }
+    // 1층 창 (반지하 없을 때 지면 가까이)
+    if (!b.basement && near) win(0.7, z0 + (b.stair ? 1.2 : 3.0), 1.2, 1.2, 88);
+  }
+
+  // 창문 (콘크리트 틀 + 블라인드)
+  if (z0 < cam.z + 95) {
+    for (let f = 1; f <= floors; f++) {
+      const wy = f * floorH + 0.45;
+      if (wy + 1.3 > b.h - (b.roof === "tile" ? 0.6 : 0.3)) break;
+      for (let c = 0; c < b.cols; c++) {
+        const wz = z0 + (c + 0.5) * (SEG / b.cols) - 0.65;
+        if (wz + 1.3 < cam.z + NEAR) continue;
+        win(wy, wz, 1.3, 1.25, c * 13 + f * 7 + 3);
+      }
+    }
+  }
+
+  // 출창(돌출창)
+  if (b.bay && near && floors >= 2) {
+    const yy = Math.min(floorH + 0.45, b.h - 2.0); // 2층 창 높이에 붙임
+    const bz0 = z0 + 1.0, bz1 = z1 - 1.0, depth = 0.4, bh = 1.25, lit = b.r(77) > 0.5;
+    quad(project(x, yy, bz1), project(x - side * depth, yy, bz1),
+         project(x - side * depth, yy + bh, bz1), project(x, yy + bh, bz1), "#221f1a");
+    quad(project(x - side * depth, yy, bz0), project(x - side * depth, yy, bz1),
+         project(x - side * depth, yy + bh, bz1), project(x - side * depth, yy + bh, bz0), lit ? "#ffce82" : "#11151c");
+    quad(project(x, yy, bz0), project(x, yy, bz1),
+         project(x - side * depth, yy, bz1), project(x - side * depth, yy, bz0), "#6b665b");
+    if (lit) { const cp = project(x - side * depth, yy + bh / 2, (bz0 + bz1) / 2);
+      if (cp) glow(cp.x, cp.y, cp.s * 0.8, "rgba(255,170,80,.4)", 0.35); }
+  }
+
+  // ---- 지붕 ----
+  if (b.roof === "tile") {
+    const eaveY = b.h, ridgeY = b.h + 1.0 + b.r(40) * 0.6, xo = x - side * 0.5;
+    const z0e = Math.max(z0 - 0.25, cam.z + NEAR), z1e = z1 + 0.25;
+    const A = project(xo, eaveY, z0e), B = project(xo, eaveY, z1e),
+          C = project(x, ridgeY, z1e - 0.7), D = project(x, ridgeY, z0e + 0.7);
+    if (A && B && C && D) {
+      const rg = ctx.createLinearGradient(0, Math.max(A.y, B.y), 0, Math.min(C.y, D.y));
+      rg.addColorStop(0, b.roofShad); rg.addColorStop(1, b.roofCol);
+      quad(A, B, C, D, rg);
+      if (near) {
+        ctx.strokeStyle = b.roofShad; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+        for (let zz = z0e + 0.3; zz < z1e; zz += 0.4) {
+          const t1 = project(xo, eaveY, zz), t2 = project(x, ridgeY, Math.min(zz, z1e - 0.7));
+          if (t1 && t2) { ctx.beginPath(); ctx.moveTo(t1.x, t1.y); ctx.lineTo(t2.x, t2.y); ctx.stroke(); }
+        }
+        ctx.globalAlpha = 1;
+      }
+      quad(project(xo, eaveY, z0e), project(xo, eaveY, z1e),
+           project(xo, eaveY - 0.2, z1e), project(xo, eaveY - 0.2, z0e), b.roofShad);
+      ctx.strokeStyle = "rgba(255,210,170,0.25)"; ctx.lineWidth = Math.max(1, A.s * 0.02);
+      ctx.beginPath(); ctx.moveTo(C.x, C.y); ctx.lineTo(D.x, D.y); ctx.stroke();
+    }
+  } else {
+    band(b.h - 0.4, 0.34, b.bandTop); // 평지붕 파라펫
+  }
+
+  // 화단 잡초
+  if (b.weeds && z0 < cam.z + 32) {
+    ctx.strokeStyle = "#3d4a2a"; ctx.lineWidth = 1; ctx.globalAlpha = 0.8;
+    for (let k = 0; k < 8; k++) {
+      const gz = z0 + 0.3 + (k / 8) * (SEG - 0.6);
+      const g0 = project(x - side * 0.12, 0, gz), g1 = project(x - side * 0.12, 0.45 + b.r(k) * 0.4, gz + 0.05);
+      if (g0 && g1) { ctx.beginPath(); ctx.moveTo(g0.x, g0.y); ctx.lineTo(g1.x, g1.y); ctx.stroke(); }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 에어컨 실외기
+  if (b.ac && z0 > cam.z + 2 && z0 < cam.z + 45) {
+    const az = z0 + (0.3 + b.r(31) * 0.4) * SEG, ay = 3.3 + b.r(32) * 3;
+    quad(project(x - side * 0.5, ay, az), project(x - side * 0.5, ay, az + 0.85),
+         project(x - side * 0.5, ay + 0.65, az + 0.85), project(x - side * 0.5, ay + 0.65, az), "#8f897e");
+    quad(project(x, ay, az + 0.85), project(x - side * 0.5, ay, az + 0.85),
+         project(x - side * 0.5, ay + 0.65, az + 0.85), project(x, ay + 0.65, az + 0.85), "#5f5a51");
+  }
+
+  // 가로등 — 초록 갓 + 주황 불빛 (전봇대 있는 칸은 제외)
+  if (b.hasLamp && !b.pole && b.lampZ > cam.z + NEAR && b.lampZ < cam.z + 120) {
+    const lampX = x - side * 0.55, lampY = 5.2;
+    const lp = project(lampX, lampY, b.lampZ);
+    if (lp) {
+      const arm = project(x, lampY + 0.25, b.lampZ);
+      if (arm) { ctx.strokeStyle = "#15140f"; ctx.lineWidth = Math.max(1, lp.s * 0.03);
+        ctx.beginPath(); ctx.moveTo(arm.x, arm.y); ctx.lineTo(lp.x, lp.y - lp.s * 0.1); ctx.stroke(); }
+      glow(lp.x, lp.y, lp.s * 4.8, "rgba(255,140,45,.6)", 0.75);
+      glow(lp.x, lp.y, lp.s * 2.4, "rgba(255,150,55,.95)", 0.95);
+      glow(lp.x, lp.y, lp.s * 0.5, "rgba(255,235,190,1)", 1);
+      // 초록 갓
+      ctx.fillStyle = "#2f5d33"; ctx.beginPath();
+      ctx.ellipse(lp.x, lp.y - lp.s * 0.14, Math.max(3, lp.s * 0.34), Math.max(2, lp.s * 0.15), 0, Math.PI, 0, true);
+      ctx.fill(); ctx.strokeStyle = "#16331a"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.beginPath(); ctx.arc(lp.x, lp.y, Math.max(1.3, lp.s * 0.1), 0, 6.28);
+      ctx.fillStyle = "#ffe9c0"; ctx.fill();
+      const gp = project(lampX * 0.5, 0, b.lampZ);
+      if (gp) glow(gp.x, gp.y, gp.s * 4.0, "rgba(255,140,40,.6)", 0.7);
+      const base = project(lampX, 0, b.lampZ);
+      if (base) reflect(base.x, base.y, (base.y - lp.y) * 0.5, "rgba(255,150,60,.5)", 0.5);
+    }
+  }
+
+  // 골목에 세워둔 스쿠터 / 분리수거통
+  if (b.prop && z0 > cam.z + 2 && z0 < cam.z + 55) {
+    const vz = z0 + 1.4, vx = x - side * 0.95;
+    if (b.prop === 1) {
+      const p0 = project(vx, 0, vz), p1 = project(vx, 0, vz + 1.7);
+      quad(p0, p1, project(vx, 1.0, vz + 1.7), project(vx, 1.0, vz), "#0e0e10");
+      const tail = project(vx, 0.6, vz + 0.1);
+      if (tail && p0) glow(tail.x, tail.y, p0.s * 0.4, "rgba(255,40,30,.8)", 0.6);
+    } else {
+      const col = b.r(71) > 0.5 ? "#26406e" : "#7a2526";
+      quad(project(vx, 0, vz), project(vx, 0, vz + 0.7),
+           project(vx, 0.9, vz + 0.7), project(vx, 0.9, vz), col);
+    }
+  }
+
+  // ---- 담장 (전경: 골목 끝 낮은 벽돌담) ----
+  if (b.wall && z0 < cam.z + 50) {
+    const xw = side * ROAD_HALF, wallH = 1.1, capH = 0.16;
+    // 측면(깊이) — 담장에서 집 전면까지
+    if (z0 > cam.z + NEAR)
+      quad(project(xw, 0, z0), project(x, 0, z0), project(x, wallH, z0), project(xw, wallH, z0), b.sideCol);
+    // 전면
+    quad(project(xw, 0, cz0), project(xw, 0, z1),
+         project(xw, wallH, z1), project(xw, wallH, cz0), b.brickBase);
+    // 줄눈
+    if (near) {
+      ctx.strokeStyle = b.mortar; ctx.lineWidth = 1; ctx.globalAlpha = 0.14;
+      for (let yy = 0.3; yy < wallH; yy += 0.32) {
+        const e1 = project(xw, yy, cz0), e2 = project(xw, yy, z1);
+        if (e1 && e2) { ctx.beginPath(); ctx.moveTo(e1.x, e1.y); ctx.lineTo(e2.x, e2.y); ctx.stroke(); }
+      }
+      ctx.globalAlpha = 1;
+    }
+    // 윗 캡 (콘크리트)
+    quad(project(xw, wallH, cz0), project(xw, wallH, z1),
+         project(xw, wallH + capH, z1), project(xw, wallH + capH, cz0), b.band);
+  }
+}
+
+// ---- 가로등 근접 워시 : 등 밑을 지날 때 화면이 따뜻하게 물듦 ----
+function lampWash() {
+  let best = 0, bx = W / 2, by = horizon;
+  const cseg = Math.floor(cam.z / SEG);
+  for (let i = cseg - 1; i <= cseg + 2; i++) {
+    for (const side of [-1, 1]) {
+      const b = building(i, side);
+      let lx, ly, lz, on = false;
+      if (b.hasLamp && !b.pole) {
+        lx = side * (ROAD_HALF + b.setback) - side * 0.55; ly = 5.2; lz = i * SEG + SEG * 0.5; on = true;
+      } else if (b.pole && b.r(46) > 0.5) {
+        const px = side * (ROAD_HALF - 0.12);
+        lx = px - side * 1.6; ly = 6.1; lz = i * SEG + SEG * (0.2 + b.r(45) * 0.3); on = true;
+      }
+      if (!on) continue;
+      const d = Math.hypot(lx - cam.x, lz - cam.z);
+      const inten = Math.max(0, 1 - d / 7);
+      if (inten > best) {
+        best = inten;
+        const p = project(lx, ly, Math.max(lz, cam.z + 0.3));
+        if (p) { bx = p.x; by = p.y; }
+      }
+    }
+  }
+  if (best <= 0.02) return;
+  ctx.globalCompositeOperation = "lighter";
+  // 전체 따뜻한 빛 번짐 (등 위치 중심)
+  const g = ctx.createRadialGradient(bx, by, 0, bx, by, H * (0.55 + best * 0.6));
+  g.addColorStop(0, `rgba(255,150,60,${0.26 * best})`);
+  g.addColorStop(0.5, `rgba(255,120,40,${0.12 * best})`);
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 발밑 바닥에 깔리는 주황 웅덩이
+  const fp = project(cam.x, 0, cam.z + 2.4);
+  if (fp) {
+    const gg = ctx.createRadialGradient(fp.x, fp.y, 0, fp.x, fp.y, H * 0.4 * best + 50);
+    gg.addColorStop(0, `rgba(255,140,50,${0.2 * best})`);
+    gg.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// ---- Utility poles (전봇대) ----
+function drawPoles() {
+  const first = Math.floor((cam.z + NEAR) / SEG) - 1;
+  const last = Math.floor((cam.z + 80) / SEG) + 1;
+  for (let i = last; i >= first; i--) {
+    for (const side of [-1, 1]) {
+      const b = building(i, side);
+      if (!b.pole) continue;
+      const pz = i * SEG + SEG * (0.2 + b.r(45) * 0.3);
+      const px = side * (ROAD_HALF - 0.12);
+      const base = project(px, 0, pz), tp = project(px, 9.5, pz);
+      if (!base || !tp) continue;
+      // 기둥
+      ctx.strokeStyle = "#1d1b16"; ctx.lineWidth = Math.max(1.5, base.s * 0.07);
+      ctx.beginPath(); ctx.moveTo(base.x, base.y); ctx.lineTo(tp.x, tp.y); ctx.stroke();
+      // 변압기
+      const tr1 = project(px - side * 0.16, 6.9, pz), tr2 = project(px - side * 0.16, 7.9, pz);
+      if (tr1 && tr2) { ctx.strokeStyle = "#14130e"; ctx.lineWidth = Math.max(3, base.s * 0.16);
+        ctx.beginPath(); ctx.moveTo(tr1.x, tr1.y); ctx.lineTo(tr2.x, tr2.y); ctx.stroke(); }
+      // 완철(crossarm)
+      for (const ay of [8.2, 8.8]) {
+        const c1 = project(px - side * 0.9, ay, pz), c2 = project(px + side * 0.45, ay, pz);
+        if (c1 && c2) { ctx.strokeStyle = "#26221b"; ctx.lineWidth = Math.max(1, base.s * 0.03);
+          ctx.beginPath(); ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y); ctx.stroke(); }
+      }
+      // 전봇대 가로등
+      if (b.r(46) > 0.5) {
+        const la = project(px - side * 1.0, 6.4, pz), lp = project(px - side * 1.6, 6.1, pz);
+        if (la && lp) {
+          ctx.strokeStyle = "#26221b"; ctx.lineWidth = Math.max(1, base.s * 0.025);
+          ctx.beginPath(); ctx.moveTo(la.x, la.y); ctx.lineTo(lp.x, lp.y); ctx.stroke();
+          glow(lp.x, lp.y, lp.s * 1.8, "rgba(255,150,55,.85)", 0.85);
+          ctx.beginPath(); ctx.arc(lp.x, lp.y, Math.max(1.2, lp.s * 0.08), 0, 6.28); ctx.fillStyle = "#ffe9c0"; ctx.fill();
+          const gp = project(px - side * 0.8, 0, pz);
+          if (gp) glow(gp.x, gp.y, gp.s * 2.6, "rgba(255,140,40,.45)", 0.5);
+        }
+      }
+    }
+  }
+}
+
+// ---- Overhead cables crossing the alley ----
+function drawCables() {
+  const first = Math.floor((cam.z + NEAR) / SEG) - 1;
+  const last = Math.floor((cam.z + 90) / SEG) + 1;
+  for (let i = last; i >= first; i--) {
+    const b = building(i, -1);
+    if (!b.cable) continue;
+    const cz = i * SEG + SEG * (0.3 + b.r(41) * 0.5);
+    const wires = 1 + Math.floor(b.r(42) * 3);
+    for (let w = 0; w < wires; w++) {
+      const attach = 6.5 + b.r(50 + w) * 3.5;
+      const sag = 1.0 + b.r(60 + w) * 1.6;
+      ctx.beginPath();
+      let started2 = false, ok = true;
+      for (let t = 0; t <= 1.001; t += 0.1) {
+        const wx = -ROAD_HALF + t * (ROAD_HALF * 2);
+        const wy = attach - sag * 4 * t * (1 - t);
+        const p = project(wx, wy, cz + w * 0.15);
+        if (!p) { ok = false; break; }
+        if (!started2) { ctx.moveTo(p.x, p.y); started2 = true; }
+        else ctx.lineTo(p.x, p.y);
+      }
+      if (!ok || !started2) continue;
+      const sc = project(0, attach, cz);
+      ctx.strokeStyle = "rgba(8,8,10,0.9)";
+      ctx.lineWidth = Math.max(0.6, (sc ? sc.s : 4) * 0.02);
+      ctx.stroke();
+    }
+  }
+}
+
+// ---- Rain ----
+const drops = Array.from({ length: 260 }, () => ({
+  x: Math.random(), y: Math.random(), len: 8 + Math.random() * 18, sp: 0.6 + Math.random() * 0.9,
+}));
+let rainOn = true;
+function drawRain() {
+  if (!rainOn) return;
+  ctx.strokeStyle = "rgba(180,195,220,0.25)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const slant = 2.2;
+  for (const d of drops) {
+    const px = d.x * W, py = d.y * H;
+    ctx.moveTo(px, py);
+    ctx.lineTo(px + slant, py + d.len);
+    d.y += d.sp * 0.018;
+    d.x += 0.0008;
+    if (d.y > 1) { d.y -= 1; d.x = Math.random(); }
+    if (d.x > 1) d.x -= 1;
+  }
+  ctx.stroke();
+  // faint mist
+  ctx.fillStyle = "rgba(120,130,150,0.03)";
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---- Main render ----
+function render() {
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+  drawSky();
+  drawGround();
+
+  const first = Math.floor((cam.z + NEAR) / SEG) - 1;
+  const last = Math.floor((cam.z + FAR) / SEG) + 1;
+  // far -> near (painter's algorithm)
+  for (let i = last; i >= first; i--) {
+    drawFacade(i, -1);
+    drawFacade(i, +1);
+  }
+
+  drawPoles();
+  drawCables();
+  drawPig();
+  drawRain();
+
+  // atmospheric fog toward vanishing point
+  const fg = ctx.createRadialGradient(W / 2, horizon, 0, W / 2, horizon, H * 0.7);
+  fg.addColorStop(0, "rgba(40,26,10,0.35)");
+  fg.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = fg; ctx.fillRect(0, 0, W, H);
+
+  // vignette
+  const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.85);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(1, "rgba(0,0,0,0.7)");
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+
+  lampWash(); // 가로등 밑을 지날 때 따뜻한 빛 번짐 (비네팅 위에)
+}
+
+// ---- Input ----
+const keys = {};
+addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  start();
+  if (k === "r") rainOn = !rainOn;
+  if (k === "m") toggleMute();
+});
+addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+let pointerWalk = false;
+canvas.addEventListener("pointerdown", () => { pointerWalk = true; start(); });
+addEventListener("pointerup", () => { pointerWalk = false; });
+
+let started = false;
+function start() {
+  if (started) return;
+  started = true;
+  title.classList.add("hidden");
+  initAudio();
+}
+
+// ---- Procedural ambient (rain hiss + low city hum), no audio files ----
+let audio = null;
+function initAudio() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctxA = new AC();
+    // pink-ish noise buffer for rain
+    const len = ctxA.sampleRate * 2;
+    const buf = ctxA.createBuffer(1, len, ctxA.sampleRate);
+    const data = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) {
+      const white = Math.random() * 2 - 1;
+      last = (last + 0.02 * white) / 1.02;
+      data[i] = last * 3.5 + white * 0.2;
+    }
+    const noise = ctxA.createBufferSource();
+    noise.buffer = buf; noise.loop = true;
+    const bp = ctxA.createBiquadFilter();
+    bp.type = "bandpass"; bp.frequency.value = 1400; bp.Q.value = 0.5;
+    const rainGain = ctxA.createGain(); rainGain.gain.value = 0.12;
+    noise.connect(bp).connect(rainGain).connect(ctxA.destination);
+    noise.start();
+    // distant low hum
+    const hum = ctxA.createOscillator(); hum.type = "sine"; hum.frequency.value = 58;
+    const humGain = ctxA.createGain(); humGain.gain.value = 0.04;
+    hum.connect(humGain).connect(ctxA.destination); hum.start();
+    audio = { ctxA, rainGain, humGain, muted: false };
+  } catch (e) { audio = null; }
+}
+function toggleMute() {
+  if (!audio) return;
+  audio.muted = !audio.muted;
+  audio.rainGain.gain.value = audio.muted ? 0 : 0.12;
+  audio.humGain.gain.value = audio.muted ? 0 : 0.04;
+}
+
+let distance = 0;
+// ---- 🐷 돼지 깜짝 이벤트 (걷다 보면 골목을 가로지름) ----
+const pig = { active: false, x: 0, z: 0, dir: 1, t: 0, walkTime: 0, nextAt: 60 };
+function spawnPig() {
+  pig.dir = Math.sin(pig.walkTime * 12.9 + cam.z) > 0 ? 1 : -1; // 방향 의사난수
+  pig.x = -pig.dir * (ROAD_HALF + 0.7);   // 한쪽 벽에서 시작
+  pig.z = cam.z + 4.2;                     // 카메라 앞쪽을 가로지름
+  pig.t = 0; pig.active = true;
+  oink();
+}
+function oink() {
+  if (!audio || audio.muted) return;
+  try {
+    const ac = audio.ctxA, t0 = ac.currentTime;
+    for (let k = 0; k < 2; k++) {
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = "sawtooth";
+      const ts = t0 + k * 0.22;
+      o.frequency.setValueAtTime(430 - k * 70, ts);
+      o.frequency.exponentialRampToValueAtTime(170, ts + 0.18);
+      g.gain.setValueAtTime(0.0001, ts);
+      g.gain.exponentialRampToValueAtTime(0.13, ts + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, ts + 0.2);
+      o.connect(g).connect(ac.destination); o.start(ts); o.stop(ts + 0.23);
+    }
+  } catch (e) {}
+}
+function drawPig() {
+  if (!pig.active) return;
+  const p = project(pig.x, 0, pig.z);
+  if (!p) return;
+  const s = p.s, dir = pig.dir;
+  const bodyLen = 1.05 * s, bodyH = 0.62 * s;
+  const cx = p.x, cy = p.y - 0.52 * s;        // 몸통 중심(지면 위)
+  const phase = pig.t * 11;
+  // 다리(총총걸음)
+  ctx.strokeStyle = "#bf7387"; ctx.lineWidth = Math.max(2, s * 0.07); ctx.lineCap = "round";
+  for (const k of [-0.3, -0.12, 0.12, 0.3]) {
+    const lx = cx + dir * k * bodyLen;
+    const sw = Math.sin(phase + k * 9) * 0.1 * s;
+    ctx.beginPath(); ctx.moveTo(lx, cy + bodyH * 0.28); ctx.lineTo(lx + sw, p.y); ctx.stroke();
+  }
+  // 꼬리(꼬불)
+  ctx.strokeStyle = "#e6a6b8"; ctx.lineWidth = Math.max(1.5, s * 0.045);
+  ctx.beginPath(); ctx.arc(cx - dir * bodyLen * 0.55, cy - bodyH * 0.08, bodyH * 0.14, -0.4, Math.PI * 1.5); ctx.stroke();
+  // 몸통
+  ctx.fillStyle = "#e6a6b8";
+  ctx.beginPath(); ctx.ellipse(cx, cy, bodyLen * 0.55, bodyH * 0.5, 0, 0, 6.28); ctx.fill();
+  // 머리
+  const hx = cx + dir * bodyLen * 0.52, hy = cy - bodyH * 0.02;
+  ctx.beginPath(); ctx.ellipse(hx, hy, bodyH * 0.43, bodyH * 0.41, 0, 0, 6.28); ctx.fill();
+  // 귀
+  ctx.beginPath();
+  ctx.moveTo(hx - dir * bodyH * 0.1, hy - bodyH * 0.32);
+  ctx.lineTo(hx + dir * bodyH * 0.16, hy - bodyH * 0.16);
+  ctx.lineTo(hx - dir * bodyH * 0.04, hy - bodyH * 0.06);
+  ctx.closePath(); ctx.fill();
+  // 주둥이(코)
+  ctx.fillStyle = "#d98aa1";
+  ctx.beginPath(); ctx.ellipse(hx + dir * bodyH * 0.36, hy + bodyH * 0.07, bodyH * 0.18, bodyH * 0.14, 0, 0, 6.28); ctx.fill();
+  // 콧구멍
+  ctx.fillStyle = "#8f5567";
+  ctx.beginPath(); ctx.arc(hx + dir * bodyH * 0.42, hy + bodyH * 0.07, Math.max(1, s * 0.014), 0, 6.28); ctx.fill();
+  ctx.beginPath(); ctx.arc(hx + dir * bodyH * 0.30, hy + bodyH * 0.07, Math.max(1, s * 0.014), 0, 6.28); ctx.fill();
+  // 눈
+  ctx.fillStyle = "#33252b";
+  ctx.beginPath(); ctx.arc(hx + dir * bodyH * 0.12, hy - bodyH * 0.06, Math.max(1, s * 0.022), 0, 6.28); ctx.fill();
+}
+
+function update(dt) {
+  const fwd = (keys["w"] || keys["arrowup"] || pointerWalk) ? 1 : 0;
+  const back = (keys["s"] || keys["arrowdown"]) ? 1 : 0;
+  const left = (keys["a"] || keys["arrowleft"]) ? 1 : 0;
+  const right = (keys["d"] || keys["arrowright"]) ? 1 : 0;
+
+  const accel = 9;
+  cam.vz += (fwd - back) * accel * dt;
+  cam.vx += (right - left) * accel * 0.8 * dt;
+  cam.vz *= 0.86; cam.vx *= 0.82;
+  cam.z += cam.vz * dt;
+  cam.x += cam.vx * dt;
+  // keep player within the alley
+  const limit = ROAD_HALF - 1.0;
+  cam.x = Math.max(-limit, Math.min(limit, cam.x));
+
+  const speed = Math.hypot(cam.vx, cam.vz);
+  cam.bob = Math.sin(performance.now() * 0.006) * Math.min(0.05, speed * 0.02);
+  distance += Math.max(0, cam.vz * dt);
+
+  // 🐷 돼지 이벤트: 걷는 동안 시간 누적 → 약 1분마다 한 번 가로지름
+  if (speed > 0.4 && !pig.active) pig.walkTime += dt;
+  if (!pig.active && pig.walkTime >= pig.nextAt) spawnPig();
+  if (pig.active) {
+    pig.t += dt;
+    const crossSpeed = (ROAD_HALF * 2 + 1.5) / 4.2; // ~4.2초에 골목 횡단
+    pig.x += pig.dir * crossSpeed * dt;
+    if (Math.abs(pig.x) > ROAD_HALF + 0.72 || pig.z < cam.z + NEAR + 0.2) {
+      pig.active = false;
+      pig.walkTime = 0;
+      pig.nextAt = 70 + Math.abs(Math.sin(now * 0.7)) * 50; // 다음 등장까지 70~120초
+    }
+  }
+
+  hud.innerHTML = `걸은 거리 <b>${distance.toFixed(0)}</b> m &nbsp;·&nbsp; 속도 <b>${speed.toFixed(1)}</b> &nbsp;·&nbsp; R 비 <b>${rainOn ? "켜짐" : "꺼짐"}</b> &nbsp;·&nbsp; M 소리`;
+}
+
+let lastT = performance.now();
+function loop(t) {
+  const dt = Math.min(0.05, (t - lastT) / 1000);
+  lastT = t;
+  now = t;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
